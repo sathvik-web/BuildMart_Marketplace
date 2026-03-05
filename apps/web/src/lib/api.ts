@@ -1,6 +1,6 @@
 import axios, { AxiosError, AxiosRequestConfig } from "axios";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
 
 export const api = axios.create({
   baseURL: `${API_URL}/api/v1`,
@@ -60,17 +60,33 @@ api.interceptors.response.use(
 
 /* ── Auth ───────────────────────────────────────────── */
 
+/* ── Auth ───────────────────────────────────────────── */
+
 export const authApi = {
-  sendOtp: (phone: string) => api.post("/auth/otp/send", { phone }),
+  async sendOtp(phone: string) {
+    const res = await api.post("/auth/otp/send", { phone });
+    return res.data;
+  },
 
-  verifyOtp: (phone: string, otpToken: string) =>
-    api.post("/auth/otp/verify", { phone, otpToken }),
+  async verifyOtp(phone: string, otpToken: string) {
+    const res = await api.post("/auth/otp/verify", { phone, otpToken });
+    return res.data;
+  },
 
-  register: (data: any) => api.post("/auth/register", data),
+  async register(data: any) {
+    const res = await api.post("/auth/register", data);
+    return res.data;
+  },
 
-  me: () => api.get("/auth/me"),
+  async me() {
+    const res = await api.get("/auth/me");
+    return res.data;
+  },
 
-  logout: () => api.post("/auth/logout"),
+  async logout() {
+    const res = await api.post("/auth/logout");
+    return res.data;
+  },
 };
 
 /* ── RFQs ───────────────────────────────────────────── */

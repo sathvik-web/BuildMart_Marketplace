@@ -2,6 +2,7 @@
 // BuildMart — Auth Controller
 // POST /api/v1/auth/otp/send
 // POST /api/v1/auth/otp/verify
+// POST /api/v1/auth/register
 // POST /api/v1/auth/refresh
 // POST /api/v1/auth/logout
 // GET  /api/v1/auth/me
@@ -17,10 +18,10 @@ import {
   HttpCode,
   HttpStatus,
   UseGuards,
-  Version,
   Ip,
   Headers,
 } from "@nestjs/common";
+
 import { FastifyReply, FastifyRequest } from "fastify";
 import { Throttle } from "@nestjs/throttler";
 import { ConfigService } from "@nestjs/config";
@@ -29,28 +30,37 @@ import { AuthService } from "./auth.service";
 import { SendOtpDto } from "./dto/send-otp.dto";
 import { VerifyOtpDto } from "./dto/verify-otp.dto";
 import { RegisterDto } from "./dto/register.dto";
+
 import { Public } from "./decorators/public.decorator";
 import { CurrentUser } from "./decorators/current-user.decorator";
 import { Roles } from "./decorators/roles.decorator";
+
+import { JwtAuthGuard } from "./guards/jwt-auth.guard";
 import { JwtRefreshGuard } from "./guards/jwt-refresh.guard";
+
 import { UserRole } from "@buildmart/database";
 import type { JwtPayload } from "./strategies/jwt.strategy";
 
 @Controller({ path: "auth", version: "1" })
 export class AuthController {
+
   private readonly isProd: boolean;
-  private readonly cookieDomain: string;
+  private readonly cookieDomain?: string;
 
   constructor(
     private readonly authService: AuthService,
     private readonly config: ConfigService,
   ) {
     this.isProd = config.get("NODE_ENV") === "production";
-    this.cookieDomain = config.get<string>("COOKIE_DOMAIN", "localhost");
+    this.cookieDomain = this.isProd
+      ? config.get<string>("COOKIE_DOMAIN")
+      : undefined;
   }
 
-  // ── 1. Request OTP ────────────────────────────────────────
-  // Rate limit: 5 OTP requests per minute per IP (see ThrottlerModule "otp")
+  // ─────────────────────────────────────────
+  // 1. SEND OTP
+  // ─────────────────────────────────────────
+
   @Public()
   @Post("otp/send")
   @HttpCode(HttpStatus.OK)
@@ -60,7 +70,10 @@ export class AuthController {
     return { message: "OTP sent successfully." };
   }
 
-  // ── 2. Verify OTP → issue tokens ─────────────────────────
+  // ─────────────────────────────────────────
+  // 2. VERIFY OTP
+  // ─────────────────────────────────────────
+
   @Public()
   @Post("otp/verify")
   @HttpCode(HttpStatus.OK)
@@ -71,6 +84,7 @@ export class AuthController {
     @Ip() ip: string,
     @Headers("user-agent") userAgent: string,
   ) {
+
     const { accessToken, refreshToken, user, isNewUser } =
       await this.authService.verifyOtp(dto, ip, userAgent);
 
@@ -79,19 +93,28 @@ export class AuthController {
     return { user, isNewUser };
   }
 
-  // ── 3. Complete registration (new users only) ─────────────
+  // ─────────────────────────────────────────
+  // 3. COMPLETE REGISTRATION
+  // ─────────────────────────────────────────
+
   @Post("register")
+  @UseGuards(JwtAuthGuard)
   @HttpCode(HttpStatus.OK)
   async register(
     @CurrentUser() user: JwtPayload,
     @Body() dto: RegisterDto,
-    @Res({ passthrough: true }) res: FastifyReply,
   ) {
-    const updated = await this.authService.completeRegistration(user.sub, dto);
-    return { user: updated };
+
+    const updatedUser =
+      await this.authService.completeRegistration(user.sub, dto);
+
+    return { user: updatedUser };
   }
 
-  // ── 4. Refresh access token ───────────────────────────────
+  // ─────────────────────────────────────────
+  // 4. REFRESH TOKEN
+  // ─────────────────────────────────────────
+
   @Public()
   @UseGuards(JwtRefreshGuard)
   @Post("refresh")
@@ -102,15 +125,22 @@ export class AuthController {
     @Ip() ip: string,
     @Headers("user-agent") userAgent: string,
   ) {
-    const refreshToken = (req.cookies as Record<string, string>)["refresh_token"];
+
+    const refreshToken =
+      (req.cookies as Record<string, string>)?.refresh_token;
+
     const { accessToken, refreshToken: newRefreshToken } =
       await this.authService.refreshTokens(refreshToken, ip, userAgent);
 
     this.setTokenCookies(res, accessToken, newRefreshToken);
+
     return { message: "Tokens refreshed." };
   }
 
-  // ── 5. Logout — clear cookies + revoke session ────────────
+  // ─────────────────────────────────────────
+  // 5. LOGOUT
+  // ─────────────────────────────────────────
+
   @Post("logout")
   @HttpCode(HttpStatus.OK)
   async logout(
@@ -118,62 +148,82 @@ export class AuthController {
     @Res({ passthrough: true }) res: FastifyReply,
     @CurrentUser() user: JwtPayload,
   ) {
-    const refreshToken = (req.cookies as Record<string, string>)["refresh_token"];
+
+    const refreshToken =
+      (req.cookies as Record<string, string>)?.refresh_token;
+
     if (refreshToken) {
       await this.authService.logout(user.sub, refreshToken);
     }
+
     this.clearTokenCookies(res);
+
     return { message: "Logged out successfully." };
   }
 
-  // ── 6. Current user profile ───────────────────────────────
+  // ─────────────────────────────────────────
+  // 6. GET CURRENT USER
+  // ─────────────────────────────────────────
+
+  @UseGuards(JwtAuthGuard)
   @Get("me")
   async me(@CurrentUser() user: JwtPayload) {
     return this.authService.getProfile(user.sub);
   }
 
-  // ── Admin-only: list all sessions ─────────────────────────
-  @Get("sessions")
+  // ─────────────────────────────────────────
+  // 7. ADMIN SESSION LIST
+  // ─────────────────────────────────────────
+
+  @UseGuards(JwtAuthGuard)
   @Roles(UserRole.ADMIN)
+  @Get("sessions")
   async sessions(@CurrentUser() user: JwtPayload) {
     return this.authService.getUserSessions(user.sub);
   }
 
-  // ─────────────────────────────────────────────────────────
-  // Private helpers
-  // ─────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────
+  // COOKIE HELPERS
+  // ─────────────────────────────────────────
 
   private setTokenCookies(
     res: FastifyReply,
     accessToken: string,
     refreshToken: string,
   ) {
-    const secure = this.isProd;
-    const domain = this.isProd ? this.cookieDomain : undefined;
 
-    // Access token: 15m, readable by JS is NOT needed — HTTP-only
+    const secure = this.isProd;
+
     res.setCookie("access_token", accessToken, {
       httpOnly: true,
       secure,
       sameSite: "lax",
-      domain,
+      domain: this.cookieDomain,
       path: "/",
-      maxAge: 15 * 60, // 15 minutes in seconds
+      maxAge: 60 * 15,
     });
 
-    // Refresh token: 30d, scoped to /api/v1/auth/refresh only
     res.setCookie("refresh_token", refreshToken, {
       httpOnly: true,
       secure,
       sameSite: "lax",
-      domain,
+      domain: this.cookieDomain,
       path: "/api/v1/auth/refresh",
-      maxAge: 30 * 24 * 60 * 60, // 30 days in seconds
+      maxAge: 60 * 60 * 24 * 30,
     });
   }
 
   private clearTokenCookies(res: FastifyReply) {
-    res.clearCookie("access_token", { path: "/" });
-    res.clearCookie("refresh_token", { path: "/api/v1/auth/refresh" });
+
+    res.clearCookie("access_token", {
+      path: "/",
+      domain: this.cookieDomain,
+    });
+
+    res.clearCookie("refresh_token", {
+      path: "/api/v1/auth/refresh",
+      domain: this.cookieDomain,
+    });
   }
+
 }
