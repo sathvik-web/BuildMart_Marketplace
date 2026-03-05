@@ -1,0 +1,1 @@
+export { KycGuard } from "./index";

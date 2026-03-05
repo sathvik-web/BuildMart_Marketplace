@@ -1,0 +1,83 @@
+{
+  "ui": "tui",
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "inputs": [
+        "src/**",
+        "prisma/**",
+        "tsconfig*.json",
+        "package.json"
+      ],
+      "outputs": [
+        "dist/**",
+        ".next/**",
+        "!.next/cache/**"
+      ]
+    },
+
+    "dev": {
+      "cache": false,
+      "persistent": true,
+      "dependsOn": []
+    },
+
+    "lint": {
+      "dependsOn": ["^build"],
+      "inputs": [
+        "src/**",
+        "*.ts",
+        ".eslintrc*",
+        "tsconfig*.json"
+      ]
+    },
+
+    "test": {
+      "dependsOn": ["^build"],
+      "inputs": [
+        "src/**",
+        "test/**",
+        "jest*.ts"
+      ],
+      "outputs": [
+        "coverage/**"
+      ]
+    },
+
+    "test:e2e": {
+      "dependsOn": ["^build"],
+      "cache": false
+    },
+
+    "db:generate": {
+      "cache": false,
+      "inputs": [
+        "prisma/schema.prisma"
+      ]
+    },
+
+    "db:migrate": {
+      "cache": false,
+      "inputs": [
+        "prisma/schema.prisma",
+        "prisma/migrations/**"
+      ]
+    },
+
+    "db:migrate:dev": {
+      "cache": false
+    },
+
+    "db:seed": {
+      "cache": false
+    },
+
+    "type-check": {
+      "dependsOn": ["^build"],
+      "inputs": [
+        "src/**",
+        "tsconfig*.json"
+      ]
+    }
+  }
+}

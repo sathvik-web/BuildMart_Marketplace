@@ -1,0 +1,642 @@
+// ============================================================
+// BuildMart — Prisma Schema
+// PostgreSQL · Prisma ORM v5
+// All monetary / quantity fields use Decimal — never Float.
+// ============================================================
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [postgis, pgcrypto, pg_trgm]
+}
+
+// ─────────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────────
+
+enum UserRole {
+  BUYER
+  VENDOR
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  PENDING_VERIFICATION
+}
+
+/// KYC gate that a Vendor must pass before they can submit quotes.
+enum VendorKycStatus {
+  PENDING    // Just registered — documents not yet uploaded
+  SUBMITTED  // Documents uploaded — awaiting Admin review
+  APPROVED   // Can bid
+  REJECTED   // Rejected with reason; can re-submit
+}
+
+/// Material categories pre-seeded for the Hyderabad market.
+enum MaterialCategory {
+  CEMENT
+  STEEL
+  SAND
+  AGGREGATE
+  BRICKS
+  ELECTRICAL
+  PLUMBING
+  PAINT
+  TILES
+  SAFETY_EQUIPMENT
+  OTHER
+}
+
+/// RFQ lifecycle — strict forward-only state machine.
+enum RfqStatus {
+  DRAFT      // Buyer still editing
+  OPEN       // Published — vendors can quote
+  QUOTED     // At least one quote received; buyer comparing
+  ACCEPTED   // Buyer accepted a quote → Order created
+  CANCELLED  // Buyer cancelled before acceptance
+  EXPIRED    // Deadline passed with no acceptance
+}
+
+/// Order fulfillment — every transition is logged in OrderStatusLog.
+enum OrderStatus {
+  PENDING     // Order created; awaiting payment
+  PAID        // Razorpay payment captured; escrow funded
+  DISPATCHED  // Vendor confirmed dispatch + uploaded e-challan
+  DELIVERED   // Buyer confirmed delivery; POD uploaded
+  COMPLETED   // Admin/system released escrow to Vendor
+  DISPUTED    // Either party raised a dispute
+  REFUNDED    // Escrow refunded to Buyer
+  CANCELLED   // Cancelled before dispatch (auto-refund)
+}
+
+enum QuoteStatus {
+  PENDING   // Submitted, buyer hasn't acted
+  ACCEPTED  // Buyer accepted — order created
+  REJECTED  // Buyer rejected
+  EXPIRED   // RFQ closed without this quote being accepted
+  WITHDRAWN // Vendor withdrew quote
+}
+
+enum PaymentStatus {
+  CREATED   // Razorpay order created
+  CAPTURED  // Payment successful
+  FAILED    // Payment failed
+  REFUNDED  // Full/partial refund issued
+}
+
+enum NotificationChannel {
+  APP
+  WHATSAPP
+  EMAIL
+  SMS
+}
+
+enum NotificationStatus {
+  QUEUED
+  SENT
+  DELIVERED
+  FAILED
+}
+
+// ─────────────────────────────────────────────
+// USERS & AUTH
+// ─────────────────────────────────────────────
+
+model User {
+  id          String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  phone       String     @unique @db.VarChar(15) // E.164 format e.g. +919876543210
+  email       String?    @unique @db.VarChar(255)
+  name        String     @db.VarChar(255)
+  role        UserRole   @default(BUYER)
+  status      UserStatus @default(ACTIVE)
+  avatarUrl   String?    @db.Text
+  firebaseUid String?    @unique @db.VarChar(128) // Firebase Auth UID for OTP
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+  deletedAt   DateTime?  // Soft delete
+
+  // Relations
+  vendorProfile  VendorProfile?
+  buyerProfile   BuyerProfile?
+  rfqs           Rfq[]
+  notifications  Notification[]
+  adminActions   AdminAuditLog[]
+  sessions       Session[]
+  reviews        VendorReview[]
+
+  @@index([phone])
+  @@index([email])
+  @@index([role, status])
+  @@map("users")
+}
+
+/// JWT refresh-token sessions stored server-side for revocation.
+model Session {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId       String   @db.Uuid
+  refreshToken String   @unique @db.Text // hashed SHA-256
+  userAgent    String?  @db.Text
+  ipAddress    String?  @db.VarChar(45)
+  expiresAt    DateTime
+  createdAt    DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+// ─────────────────────────────────────────────
+// BUYER PROFILE
+// ─────────────────────────────────────────────
+
+model BuyerProfile {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId         String   @unique @db.Uuid
+  companyName    String?  @db.VarChar(255)
+  gstinNumber    String?  @db.VarChar(15)
+  billingAddress String?  @db.Text
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("buyer_profiles")
+}
+
+// ─────────────────────────────────────────────
+// VENDOR PROFILE & KYC GATE
+// ─────────────────────────────────────────────
+
+/// Core vendor profile — KYC gate must be APPROVED before vendor can bid.
+model VendorProfile {
+  id                String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId            String          @unique @db.Uuid
+  businessName      String          @db.VarChar(255)
+  gstinNumber       String          @unique @db.VarChar(15)
+  businessPan       String          @db.VarChar(10)
+  shopLicenseNumber String          @db.VarChar(100)
+  kycStatus         VendorKycStatus @default(PENDING)
+  kycRejectionNote  String?         @db.Text
+  kycReviewedAt     DateTime?
+  kycReviewedBy     String?         @db.Uuid // Admin user id
+
+  // Service area — PostGIS point (longitude, latitude)
+  // Stored as WGS-84. Matching engine filters vendors within 50 km.
+  warehouseLat      Decimal?        @db.Decimal(10, 7)
+  warehouseLng      Decimal?        @db.Decimal(10, 7)
+  serviceRadiusKm   Int             @default(50)
+
+  // Vendor metrics (denormalised for fast leaderboard queries)
+  totalOrders       Int             @default(0)
+  avgRating         Decimal         @default(0) @db.Decimal(3, 2)
+  totalReviews      Int             @default(0)
+
+  whatsappNumber    String?         @db.VarChar(15)
+  bankAccountName   String?         @db.VarChar(255)
+  bankAccountNumber String?         @db.VarChar(20)
+  bankIfscCode      String?         @db.VarChar(11)
+  razorpayContactId String?         @db.VarChar(50)  // Razorpay contact for payouts
+  razorpayFundAccountId String?     @db.VarChar(50)
+
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  user         User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  kycDocuments VendorKycDocument[]
+  quotes       Quote[]
+  orders       Order[]
+  reviews      VendorReview[]
+  categories   VendorCategory[]
+
+  @@index([kycStatus])
+  @@index([warehouseLat, warehouseLng])
+  @@map("vendor_profiles")
+}
+
+/// KYC documents uploaded by the vendor.
+model VendorKycDocument {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  vendorProfileId String   @db.Uuid
+  documentType    String   @db.VarChar(50) // e.g. GSTIN_CERT, SHOP_LICENSE, PAN_CARD
+  fileUrl         String   @db.Text        // S3 / Cloudflare R2 presigned URL
+  fileKey         String   @db.VarChar(500) // storage object key
+  mimeType        String   @db.VarChar(100)
+  fileSizeBytes   Int
+  uploadedAt      DateTime @default(now())
+
+  vendorProfile VendorProfile @relation(fields: [vendorProfileId], references: [id], onDelete: Cascade)
+
+  @@index([vendorProfileId])
+  @@map("vendor_kyc_documents")
+}
+
+/// Material categories a vendor deals in — used by matching engine.
+model VendorCategory {
+  vendorProfileId String           @db.Uuid
+  category        MaterialCategory
+
+  vendorProfile VendorProfile @relation(fields: [vendorProfileId], references: [id], onDelete: Cascade)
+
+  @@id([vendorProfileId, category])
+  @@map("vendor_categories")
+}
+
+// ─────────────────────────────────────────────
+// PRODUCT CATALOG
+// ─────────────────────────────────────────────
+
+/// Pre-seeded material grades (e.g. OPC 53 Grade, Fe 500D TMT).
+model Material {
+  id          String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  category    MaterialCategory
+  name        String           @db.VarChar(255) // e.g. "OPC 53 Grade Cement"
+  grade       String?          @db.VarChar(100) // e.g. "53 Grade", "Fe 500D"
+  brand       String?          @db.VarChar(100)
+  unitOfMeasure String         @db.VarChar(20)  // e.g. "BAG", "MT", "CFT", "UNIT"
+  description String?          @db.Text
+  isActive    Boolean          @default(true)
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  rfqItems   RfqItem[]
+  quoteItems QuoteItem[]
+
+  @@unique([category, name, grade, brand])
+  @@index([category, isActive])
+  @@map("materials")
+}
+
+// ─────────────────────────────────────────────
+// RFQ — REQUEST FOR QUOTATION
+// ─────────────────────────────────────────────
+
+model Rfq {
+  id               String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  referenceNumber  String      @unique @db.VarChar(20) // BM-RFQ-20240001
+  buyerId          String      @db.Uuid
+
+  title            String      @db.VarChar(500)
+  description      String?     @db.Text
+  status           RfqStatus   @default(DRAFT)
+
+  // Delivery site — geo-fenced to 50 km radius of Hyderabad
+  deliveryAddress  String      @db.Text
+  deliveryCity     String      @db.VarChar(100) @default("Hyderabad")
+  deliveryState    String      @db.VarChar(100) @default("Telangana")
+  deliveryPincode  String      @db.VarChar(10)
+  deliveryLat      Decimal     @db.Decimal(10, 7)  // WGS-84
+  deliveryLng      Decimal     @db.Decimal(10, 7)
+
+  requireDelivery  Boolean     @default(true)   // vs. self-pickup
+  expectedDeliveryDate DateTime?
+
+  // Matching engine will set this after geo-filter
+  vendorsNotified  Int         @default(0)
+  quotesReceived   Int         @default(0)      // denormalised counter
+
+  publishedAt      DateTime?
+  expiresAt        DateTime?
+  closedAt         DateTime?
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+
+  buyer  User       @relation(fields: [buyerId], references: [id])
+  items  RfqItem[]
+  quotes Quote[]
+  order  Order?
+
+  @@index([buyerId, status])
+  @@index([status, expiresAt])
+  @@index([deliveryLat, deliveryLng])
+  @@map("rfqs")
+}
+
+/// Line items within an RFQ — one row per material/grade.
+model RfqItem {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  rfqId        String   @db.Uuid
+  materialId   String   @db.Uuid
+  quantity     Decimal  @db.Decimal(18, 4) // Prisma.Decimal — never Float
+  unitOfMeasure String  @db.VarChar(20)
+  specifications String? @db.Text          // e.g. "ISI marked, 50 kg bags"
+  sortOrder    Int      @default(0)
+
+  rfq      Rfq      @relation(fields: [rfqId], references: [id], onDelete: Cascade)
+  material Material @relation(fields: [materialId], references: [id])
+
+  @@index([rfqId])
+  @@map("rfq_items")
+}
+
+// ─────────────────────────────────────────────
+// QUOTES
+// ─────────────────────────────────────────────
+
+model Quote {
+  id              String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  referenceNumber String      @unique @db.VarChar(20) // BM-QT-20240001
+  rfqId           String      @db.Uuid
+  vendorProfileId String      @db.Uuid
+  status          QuoteStatus @default(PENDING)
+
+  // Pricing — all Decimal
+  subtotalAmount  Decimal     @db.Decimal(18, 2)
+  gstAmount       Decimal     @db.Decimal(18, 2)
+  deliveryCharges Decimal     @default(0) @db.Decimal(18, 2)
+  totalAmount     Decimal     @db.Decimal(18, 2)
+  gstPercent      Decimal     @db.Decimal(5, 2)  // e.g. 18.00
+
+  validUntil      DateTime
+  deliveryDays    Int                             // estimated calendar days
+  notes           String?     @db.Text
+  termsConditions String?     @db.Text
+
+  acceptedAt      DateTime?
+  rejectedAt      DateTime?
+  withdrawnAt     DateTime?
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  rfq           Rfq            @relation(fields: [rfqId], references: [id])
+  vendorProfile VendorProfile  @relation(fields: [vendorProfileId], references: [id])
+  items         QuoteItem[]
+  order         Order?
+
+  @@unique([rfqId, vendorProfileId])  // One quote per vendor per RFQ
+  @@index([rfqId, status])
+  @@index([vendorProfileId, status])
+  @@map("quotes")
+}
+
+/// Line items in a vendor's quote — maps to RfqItem.
+model QuoteItem {
+  id            String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  quoteId       String  @db.Uuid
+  materialId    String  @db.Uuid
+  quantity      Decimal @db.Decimal(18, 4)
+  unitOfMeasure String  @db.VarChar(20)
+  unitPrice     Decimal @db.Decimal(18, 4) // price per UOM — Decimal
+  totalPrice    Decimal @db.Decimal(18, 2) // quantity × unitPrice
+  brand         String? @db.VarChar(100)
+  notes         String? @db.Text
+
+  quote    Quote    @relation(fields: [quoteId], references: [id], onDelete: Cascade)
+  material Material @relation(fields: [materialId], references: [id])
+
+  @@index([quoteId])
+  @@map("quote_items")
+}
+
+// ─────────────────────────────────────────────
+// ORDERS & FULFILLMENT STATE MACHINE
+// ─────────────────────────────────────────────
+
+model Order {
+  id              String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderNumber     String      @unique @db.VarChar(20) // BM-ORD-20240001
+  rfqId           String      @unique @db.Uuid
+  quoteId         String      @unique @db.Uuid
+  vendorProfileId String      @db.Uuid
+  status          OrderStatus @default(PENDING)
+
+  // Financials — all Decimal
+  subtotalAmount   Decimal    @db.Decimal(18, 2)
+  gstAmount        Decimal    @db.Decimal(18, 2)
+  deliveryCharges  Decimal    @db.Decimal(18, 2)
+  totalAmount      Decimal    @db.Decimal(18, 2)
+  platformFeeRate  Decimal    @db.Decimal(5, 4)  // e.g. 0.0200 = 2%
+  platformFeeAmount Decimal   @db.Decimal(18, 2)
+  vendorPayoutAmount Decimal  @db.Decimal(18, 2) // totalAmount − platformFee
+
+  // Delivery
+  deliveryAddress  String     @db.Text
+  deliveryLat      Decimal    @db.Decimal(10, 7)
+  deliveryLng      Decimal    @db.Decimal(10, 7)
+  expectedDeliveryDate DateTime?
+  actualDeliveryDate   DateTime?
+
+  // Razorpay Escrow
+  razorpayOrderId    String?  @unique @db.VarChar(100)
+  razorpayPaymentId  String?  @unique @db.VarChar(100)
+  razorpayPayoutId   String?  @unique @db.VarChar(100) // vendor payout
+  escrowReleaseAt    DateTime?
+
+  // Dispute
+  disputeRaisedAt    DateTime?
+  disputeRaisedBy    String?   @db.Uuid
+  disputeNote        String?   @db.Text
+  disputeResolvedAt  DateTime?
+
+  cancelledAt        DateTime?
+  cancellationReason String?   @db.Text
+
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  rfq            Rfq              @relation(fields: [rfqId], references: [id])
+  quote          Quote            @relation(fields: [quoteId], references: [id])
+  vendorProfile  VendorProfile    @relation(fields: [vendorProfileId], references: [id])
+  payment        Payment?
+  statusLogs     OrderStatusLog[]
+  deliveries     DeliveryEvent[]
+  review         VendorReview?
+
+  @@index([status])
+  @@index([vendorProfileId, status])
+  @@map("orders")
+}
+
+/// Immutable audit trail of every state transition for an Order.
+model OrderStatusLog {
+  id          String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId     String      @db.Uuid
+  fromStatus  OrderStatus?
+  toStatus    OrderStatus
+  changedById String?     @db.Uuid  // User who triggered the transition
+  reason      String?     @db.Text
+  metadata    Json?                 // e.g. Razorpay event payload
+  occurredAt  DateTime    @default(now())
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId, occurredAt])
+  @@map("order_status_logs")
+}
+
+// ─────────────────────────────────────────────
+// PROOF OF DELIVERY (POD)
+// ─────────────────────────────────────────────
+
+/// Each physical delivery event — supports partial deliveries.
+model DeliveryEvent {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId         String   @db.Uuid
+
+  // POD — required to release escrow
+  eChallanUrl     String?  @db.Text        // signed e-challan photo (S3/R2)
+  eChallanKey     String?  @db.VarChar(500)
+  podPhotoUrls    String[] @db.Text        // multiple photos allowed
+  podPhotoKeys    String[] @db.Text
+
+  // GPS capture at time of delivery upload
+  podLat          Decimal? @db.Decimal(10, 7)
+  podLng          Decimal? @db.Decimal(10, 7)
+  podAccuracyM    Decimal? @db.Decimal(8, 2)  // GPS accuracy in metres
+
+  dispatchedAt    DateTime?
+  deliveredAt     DateTime?
+  podSubmittedAt  DateTime?
+  podVerifiedAt   DateTime?   // Admin/system verification
+  podVerifiedById String?     @db.Uuid
+
+  vehicleNumber   String?  @db.VarChar(20)
+  driverName      String?  @db.VarChar(255)
+  driverPhone     String?  @db.VarChar(15)
+  notes           String?  @db.Text
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@map("delivery_events")
+}
+
+// ─────────────────────────────────────────────
+// PAYMENTS
+// ─────────────────────────────────────────────
+
+model Payment {
+  id                  String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId             String        @unique @db.Uuid
+  razorpayOrderId     String        @unique @db.VarChar(100)
+  razorpayPaymentId   String?       @unique @db.VarChar(100)
+  razorpaySignature   String?       @db.Text  // HMAC-SHA256 verification
+  status              PaymentStatus @default(CREATED)
+
+  amount              Decimal       @db.Decimal(18, 2) // INR — paise stored as Decimal
+  currency            String        @default("INR") @db.VarChar(3)
+  method              String?       @db.VarChar(50)    // upi, card, netbanking
+  bank                String?       @db.VarChar(100)
+  wallet              String?       @db.VarChar(50)
+  vpa                 String?       @db.VarChar(100)   // UPI VPA
+
+  // Refund
+  refundId            String?       @unique @db.VarChar(100)
+  refundAmount        Decimal?      @db.Decimal(18, 2)
+  refundReason        String?       @db.Text
+  refundedAt          DateTime?
+
+  capturedAt          DateTime?
+  failureCode         String?       @db.VarChar(100)
+  failureDescription  String?       @db.Text
+  webhookPayload      Json?         // raw Razorpay webhook body for audit
+
+  createdAt           DateTime      @default(now())
+  updatedAt           DateTime      @updatedAt
+
+  order Order @relation(fields: [orderId], references: [id])
+
+  @@index([razorpayOrderId])
+  @@index([status])
+  @@map("payments")
+}
+
+// ─────────────────────────────────────────────
+// VENDOR REVIEWS
+// ─────────────────────────────────────────────
+
+model VendorReview {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId         String   @unique @db.Uuid
+  vendorProfileId String   @db.Uuid
+  reviewerId      String   @db.Uuid      // Buyer user id
+
+  rating          Int                    // 1–5 enforced at app layer
+  comment         String?  @db.Text
+  qualityRating   Int?                   // sub-rating: material quality
+  deliveryRating  Int?                   // sub-rating: on-time delivery
+  communicationRating Int?              // sub-rating: responsiveness
+
+  isPublic        Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  order         Order         @relation(fields: [orderId], references: [id])
+  vendorProfile VendorProfile @relation(fields: [vendorProfileId], references: [id])
+  reviewer      User          @relation(fields: [reviewerId], references: [id])
+
+  @@index([vendorProfileId])
+  @@map("vendor_reviews")
+}
+
+// ─────────────────────────────────────────────
+// NOTIFICATIONS
+// ─────────────────────────────────────────────
+
+model Notification {
+  id         String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId     String             @db.Uuid
+  channel    NotificationChannel
+  status     NotificationStatus @default(QUEUED)
+
+  title      String             @db.VarChar(255)
+  body       String             @db.Text
+  metadata   Json?              // e.g. { rfqId, orderId }
+
+  externalId String?            @db.VarChar(255) // WhatsApp/Twilio message SID
+  sentAt     DateTime?
+  deliveredAt DateTime?
+  failureReason String?         @db.Text
+
+  createdAt  DateTime           @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status])
+  @@index([channel, status, createdAt])
+  @@map("notifications")
+}
+
+// ─────────────────────────────────────────────
+// ADMIN AUDIT LOG
+// ─────────────────────────────────────────────
+
+model AdminAuditLog {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  adminId    String   @db.Uuid
+  action     String   @db.VarChar(100) // e.g. APPROVE_VENDOR_KYC, SUSPEND_USER
+  targetType String   @db.VarChar(50)  // e.g. VendorProfile, Order, User
+  targetId   String   @db.Uuid
+  before     Json?
+  after      Json?
+  ipAddress  String?  @db.VarChar(45)
+  userAgent  String?  @db.Text
+  occurredAt DateTime @default(now())
+
+  admin User @relation(fields: [adminId], references: [id])
+
+  @@index([adminId])
+  @@index([targetType, targetId])
+  @@index([occurredAt])
+  @@map("admin_audit_logs")
+}
+
+// ─────────────────────────────────────────────
+// SEQUENCE COUNTERS (for human-readable IDs)
+// ─────────────────────────────────────────────
+
+/// Atomic counters for generating sequential reference numbers.
+model SequenceCounter {
+  name      String @id @db.VarChar(50)  // e.g. "RFQ", "QUOTE", "ORDER"
+  nextValue Int    @default(1)
+
+  @@map("sequence_counters")
+}

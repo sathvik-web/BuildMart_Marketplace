@@ -1,0 +1,14 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "BuildMart Dev",
+      "Group": "Servers",
+      "Host": "postgres",
+      "Port": 5432,
+      "MaintenanceDB": "buildmart_dev",
+      "Username": "buildmart",
+      "SSLMode": "disable",
+      "PassFile": "/pgpass"
+    }
+  }
+}

@@ -1,0 +1,140 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────
+# BuildMart — Local Development Docker Compose
+#
+# Default services (pnpm docker:up):
+#   postgres  — PostgreSQL 16 + PostGIS 3.4  :5432
+#   redis     — Redis 7                       :6379
+#
+# Tool services (pnpm docker:up:tools):
+#   redis-ui  — RedisInsight GUI              :8001
+#   pgadmin   — pgAdmin 4                     :5050
+#
+# Full stack (with API container):
+#   docker compose --profile full up
+# ─────────────────────────────────────────────────────────────
+
+networks:
+  buildmart-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  pgadmin_data:
+
+services:
+
+  # ── PostgreSQL 16 + PostGIS ───────────────────────────────
+  postgres:
+    image: postgis/postgis:16-3.4-alpine
+    container_name: buildmart_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-buildmart}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-buildmart_dev_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-buildmart_dev}
+      TZ: Asia/Kolkata
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-buildmart} -d ${POSTGRES_DB:-buildmart_dev}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - buildmart-net
+    command: >
+      postgres
+        -c max_connections=200
+        -c shared_buffers=256MB
+        -c effective_cache_size=1GB
+        -c log_min_duration_statement=500
+        -c log_statement=ddl
+        -c timezone=Asia/Kolkata
+
+  # ── Redis 7 ───────────────────────────────────────────────
+  redis:
+    image: redis:7.2-alpine
+    container_name: buildmart_redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+      - ./docker/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    command: redis-server /usr/local/etc/redis/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - buildmart-net
+
+  # ── NestJS API (containerised, optional) ─────────────────
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    container_name: buildmart_api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-buildmart}:${POSTGRES_PASSWORD:-buildmart_dev_secret}@postgres:5432/${POSTGRES_DB:-buildmart_dev}
+      REDIS_URL: redis://redis:6379
+      NODE_ENV: production
+    ports:
+      - "${API_PORT:-3001}:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - buildmart-net
+    profiles:
+      - full   # docker compose --profile full up
+
+  # ── RedisInsight ──────────────────────────────────────────
+  redis-ui:
+    image: redis/redisinsight:latest
+    container_name: buildmart_redis_ui
+    restart: unless-stopped
+    ports:
+      - "8001:5540"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - buildmart-net
+    profiles:
+      - tools
+
+  # ── pgAdmin 4 ─────────────────────────────────────────────
+  pgadmin:
+    image: dpage/pgadmin4:8
+    container_name: buildmart_pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@buildmart.local}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+    ports:
+      - "${PGADMIN_PORT:-5050}:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+      - ./docker/pgadmin/servers.json:/pgadmin4/servers.json:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - buildmart-net
+    profiles:
+      - tools

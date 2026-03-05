@@ -1,0 +1,18 @@
+import { initializeApp, getApps } from "firebase/app";
+import { getAuth, RecaptchaVerifier, signInWithPhoneNumber } from "firebase/auth";
+
+const firebaseConfig = {
+  apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
+  authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
+  projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
+};
+
+const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0];
+export const auth = getAuth(app);
+
+export async function sendPhoneOtp(phone: string, recaptchaContainerId: string) {
+  const verifier = new RecaptchaVerifier(auth, recaptchaContainerId, { size: "invisible" });
+  const e164 = phone.startsWith("+91") ? phone : `+91${phone.replace(/\D/g, "")}`;
+  const confirmationResult = await signInWithPhoneNumber(auth, e164, verifier);
+  return confirmationResult;
+}
