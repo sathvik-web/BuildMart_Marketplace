@@ -4,12 +4,12 @@ import { PrismaService } from "../database/database.module";
 import { NotificationService } from "../notification/notification.service";
 import { Prisma, OrderStatus, PaymentStatus } from "@buildmart/database";
 import { createHmac } from "crypto";
-import Razorpay from "razorpay";
+const Razorpay = require("razorpay");
 
 @Injectable()
 export class PaymentService {
   private readonly logger = new Logger(PaymentService.name);
-  private rp: Razorpay;
+  private rp: any;
   private webhookSecret: string;
 
   constructor(private prisma: PrismaService, private notif: NotificationService, config: ConfigService) {
