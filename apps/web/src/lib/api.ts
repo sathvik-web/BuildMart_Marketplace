@@ -22,6 +22,15 @@ export type VendorProfile = {
   createdAt?: string;
 };
 
+export type Material = {
+  id: string;
+  name: string;
+  category?: string;
+  grade?: string;
+  unit?: string;
+  createdAt?: string;
+};
+
 export type Analytics = {
   totalUsers: number;
   totalVendors: number;
